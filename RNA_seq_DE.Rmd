@@ -1,0 +1,900 @@
+---
+title: "RNA-Seq analysis pipline(Customized for GSE168496)"
+author: "Shihan Zhang"
+date: "2023-02-21"
+output:
+  pdf_document: 
+    latex_engine: xelatex
+  html_document: default
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction:
+This Rmarkdown file contains all of the procedures required for pre-processing and quality checking RNA sequencing data from 'GSE168496'.
+
+!!! Please keep in mind that the raw sequence quality checking with 'FastQC' and read alignment with 'Kallisto' are not included in this pipeline.
+
+In this Rmarkdown file, I'm assuming we're working on a brand-new VM with no programming environment loaded. As a result, you can proceed with the instructions without being concerned about the pre-request for package installation.
+
+This pipeline refers to the differential expression analysis process for mouse RNA sequencing data published by Chen et al. (2016) and the RNA sequencing data analysis process (third version) using the limma package published by Law et al. (2018).
+
+# 1. Installing the pre-requred programming envirnments
+Let's first confirm that these environments have already been deployed.
+For miniconda installation, please jump to section 8.2
+
+```{bash eval=FALSE, include=TRUE}
+# check python version
+ python3 --version
+# If it returns 'Python 3.x.xx,' that means you have Python already installed. If it returns something like 'unknown command,' it means we need to install Python right now.
+
+# Install python
+ sudo apt install python3.8
+# Add python to PATH
+ export PATH=$PATH:/usr/local/bin/python3.8
+# check python version
+ python3 --version
+```
+
+# 2. Build R virtual environment
+A virtual environment allows you to create an isolated environment with its own dependencies and libraries, separate from the local system's. This ensures that your project's dependencies are kept separate and consistent, and avoids conflicts with other projects or system libraries.
+```{r eval=FALSE, include=TRUE}
+# Install the virtual environment for your project
+install.packages("renv")
+# Load the package
+library(renv)
+# Initialize the venv
+renv::init(project = getwd(), bare = TRUE)
+```
+
+## 2.1 Installing the required packages
+```{r eval=FALSE, include=TRUE}
+# Install the R package for our project
+ if (!require("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+BiocManager::install("Rsubread")
+BiocManager::install("GEOquery")
+BiocManager::install("edgeR")
+BiocManager::install("limma")
+
+# Install required packages via CRAN
+install.packages(c('ggplot2', 'tidyr', 'rmarkdown', 'knitr', 'remotes', 'superheat','lubridate','tidyverse'))
+# Install addition package for download FastQ files
+remotes::install_github('alexvpickering/GEOfastq', force = T)
+
+# Install devtools
+install.packages("devtools")
+# Install superheat
+devtools::install_github("rlbarter/superheat")
+```
+
+# 3. Load package
+!!! please be in mind, every time you open project(new R session you need to load the packages)
+```{r eval=TRUE, message=FALSE, warning=FALSE, include=TRUE}
+library(ggplot2)
+library(ggrepel)
+library(ggpubr)
+library(tidyr)
+library(GEOfastq)
+library(GEOquery)
+library(Rsubread)
+library(limma)
+library(tidyverse)
+library(lubridate)
+library(edgeR)
+library(RColorBrewer)
+library(superheat)
+```
+
+Save the virtual environment setup
+```{r eval=FALSE, include=TRUE}
+# Save changes in renv environment 
+renv::snapshot()
+```
+
+# 4. Dowload the FastQ files for GEO
+## Retrieve data from GEO
+Now the environment is ready, we will start to download the RNA sequences files from the GEO database.
+```{r eval=FALSE, include=TRUE}
+# Using package GEOfastq
+# series code
+gse_name <- 'GSE168496'
+gse_text <- crawl_gse(gse_name)
+```
+
+## Extract the sample accessions
+```{r eval=FALSE, include=TRUE}
+# extract metadata
+gsm_names <- extract_gsms(gse_text)
+```
+
+## FastQ downloading
+Before the actual downloading start. Let's create a folder to store them.
+!!! Please be in mind the raw RNA sequences file size can be really large, please store them in a local disk/drive with at least 300GB.
+```{bash eval=FALSE, include=TRUE}
+mkdir ~/Downloads/fastQ_gzs
+```
+
+Let's start to download the files
+```{r eval=FALSE, include=TRUE}
+# Set the timeout config so that the download won't be interrupted
+options(timeout=1e6)
+
+# Set the storing dir
+data_dir <- '~/Downloads/fastQ_gzs'
+
+# Loop all subsets
+for(i in gsm_names){
+  gsm_name <- i
+  print(paste('Retrieving Sample:',gsm_name))
+  # Metadata
+  srp_meta <- crawl_gsms(gsm_name)
+  # Extract SRR code
+  srr_code <- srp_meta[1,1]
+  print(paste('Retrieving SSR:',srr_code))
+  
+  # Example using smaller file
+  srp_meta <- data.frame(
+      run  = srr_code,
+      row.names = srr_code,
+      gsm_name = gsm_name,
+      ebi_dir = get_dldir(srr_code), stringsAsFactors = FALSE)
+  
+  # Download the above fastQ file
+  res <- get_fastqs(srp_meta, data_dir)
+}
+```
+
+Now we want to unpack the compressed file all at once. We can use the command line to do it.
+```{bash eval=FALSE, include=TRUE}
+mkdir ~/Downloads/fastQ_files && cd ~/Downloads/fastQ_gzs && gunzip -c *.gz | tar xvf - -C ~/Downloads/fastQ_files
+```
+
+# 5. Generating the QC report for each fastQ file
+Here we want to check the quality of the raw sequences. Rsubread can generate the QC report for us.
+## Pre-process for generating the QC report
+```{r eval=FALSE, include=TRUE}
+# Set the directory path to the folder containing the files
+dir_path <- '/pvol/fastQ_files'
+
+# Use the list.files() function to get a vector of file names
+all_fastQ_files <- list.files(path = dir_path, full.names = T)
+# get only the file name
+fastQ_name <- list.files(path = dir_path, full.names = F)
+
+# QC report generating function
+makeQC <- function(file_path,fastQName){
+  # generate the QC report
+  print(paste("Processing:",fastQName))
+  QS <- qualityScores(file_path)
+  # make the plot
+  boxplot(QS, ylab="Quality score", xlab="Base position",
+        main =fastQName, cex=0.25, col="orange")
+}
+
+```
+
+The make plot function is ready. We want to initialize a PDF object and put all the plots into the PDF file. Here, I choose to make four plots on every single PDF page. Remember to close the I/O every time after you write to a file.
+```{r eval=FALSE, include=TRUE}
+# init the PDF with 
+pdf(file= "/rd120/FastQ_QC_report.pdf" )
+
+# iterate the QC report
+for (i in 1:4) {
+  # Each page of PDF contains 4 single QC report
+  par(mfrow = c(2, 2))
+  # single QC report 
+  for (j in seq(from = (i-1)*4+1, to = i*4)) {
+    # QC report generation
+    makeQC(all_fastQ_files[j],fastQ_name[j])
+  }
+}
+ 
+# close the I/O 
+dev.off()
+```
+
+# 6. Build Genome index
+In this step, please specify the full file path and make sure your free disk volume has at least 100GB and free RAM for at least 20GB.
+```{r eval=FALSE, include=TRUE}
+# Use Rsubread to build index
+buildindex(basename = '/rd120/GRCh38.p12_index.idx',
+           reference = '/pvol/index_file/GCF_000001405.38_GRCh38.p12_genomic.fna.gz')
+```
+
+# 7. Aligning Reads
+Make a new folder to place all the aligned BAM files
+```{bash eval=FALSE, include=TRUE}
+mkdir /rd120/all_bam
+```
+
+- In this step, please specify the full file path and make sure your free disk volume has at least 50GB and free RAM for at least 16GB.
+
+- We give the output file a full file path name because we don't need to change the Rstudio default output path every time.
+```{r eval=FALSE, include=TRUE}
+# Extract the SRR code
+all_bam <- sub(".fastq", ".bam", all_fastQ_files)
+
+# Assign new file name with full file path 
+output_name <- gsub("/pvol/fastQ_files/", "/rd120/all_bam/", all_bam)
+
+# Run the alignment
+align(index='/rd120/GRCh38.p12_index.idx', readfile1=all_fastQ_files,
+      input_format="FASTQ", output_file=output_name)
+```
+
+# 8 Quantify the reads
+## 8.1 Quantify the reads - unsort & unfiltered
+```{r eval=FALSE, include=TRUE}
+# Generate count table
+quant <- featureCounts(output_name, 
+                       annot.ext='/rd120/GCF_000001405.38_GRCh38.p12_genomic.gtf',
+                       isGTFAnnotationFile = T)
+
+# Save to local
+write.csv(quant$counts, "/rd120/quant.csv") 
+```
+
+## 8.2 Filter the reads before the quantification.
+But in order to enhance the effectiveness of the downstream analysis, I would rather execute quality control measures before quantification. However I'm unsure of how much the improvement will amount to, so this strategy is also a test.
+
+## 8.2.1 Install miniconda 
+The simple way to install the tool "Sambamba" is first to install Miniconda. Miniconda can be used to install a variety of bioinformatics tools.
+```{bash eval=FALSE, include=TRUE}
+# To get the most recent Miniconda, click the link below.
+https://docs.conda.io/en/latest/miniconda.html
+
+# After the download, lets check the name of the file
+ls /home/shihanzhang/Downloads
+
+# We can found the file 'Miniconda3-py38_23.1.0-1-Linux-x86_64.sh'. now we run the installation
+bash Miniconda3-py38_23.1.0-1-Linux-x86_64.sh
+
+# Now we add Miniconda to the PATH
+export PATH=～/miniconda3/bin:$PATH 
+
+# Now we can build a virtual environment with Conda for our project
+conda create --name RNA_DE
+
+# Activate the venv - every time we open a terminal and want to use any package within the Conda, we need to activate this venv
+conda activate RNA_DE
+```
+
+## 8.2.2 Install the Sambamba
+Now we can install Sambamba through Miniconda
+```{bash eval=FALSE, include=TRUE}
+# Within the Conda venv we install the Sambamba
+conda install -c bioconda sambamba
+# Verify the installation of Sambamba
+sambamba --version
+```
+
+## 8.3 Sorting BAM files by genomic coordinates
+Make some new folders to store the files
+```{bash eval=FALSE, include=TRUE}
+mkdir /rd120/sorted_bam
+mkdir /rd120/filtered_bam
+```
+
+Right here, I wrote a bash script to handle the BAM sorting iterations, the .sh file call 'sort_all.sh'. Here is the code. 
+
+- !!! We must be aware that the sambamba need will generate some temporary files using the sorting process. The system default path for store temporary will be full within a few iterations. And the system or Rstudio will become really slow or even stuck. We want to make a folder in our large local disk to store the temporary files.
+```{bash eval=FALSE, include=TRUE}
+# If you already faced the above problem, run this code to clean up the tmp folder
+sudo rm -rf /tmp/*
+# Make a folder to store the temp files.
+mkdir /rd120/sambamba_temp
+```
+
+To write the following bash script, Just type 'nano sort_all.sh' to start writing the script.
+
+Copy and paste the below codes and make sure you modify all the input/output/temp/ files paths to your own file path. After you finish editing, just press the 'ctrl+x', then press 'Y' to confirm to save the file.
+```
+#!/bin/bash
+
+# Loop over all BAM files in /rd120/all_bam directory
+for bamfile in /rd120/all_bam/*.bam; do
+    # Get the basename of the input BAM file (e.g. SRR13895078.bam)
+    bamfile_basename=$(basename "$bamfile")
+    # Construct output BAM file path (e.g. /rd120/sorted_bam/sorted_SRR13895078.bam)
+    outbamfile="/rd120/sorted_bam/sorted_${bamfile_basename}"
+    # Print the name of the file that's being processed
+    echo "Processing file: $bamfile_basename"
+    # Run the sambamba sort command with 6 threads
+    # !!! --tmpdir set with our created temp file folder
+    sambamba sort -t 6 --tmpdir=/rd120/sambamba_temp -p -o "$outbamfile" "$bamfile"
+done
+```
+
+```{bash eval=FALSE, include=TRUE}
+# Run the bash script
+bash sort_all.sh
+```
+
+## 8.4 Filter the uniquely mapping reads
+Same idea as above, I wrote a bash script to handle the filtering process.
+```
+#!/bin/bash
+
+# Define input and output directories
+input_dir="/rd120/sorted_bam/"
+output_dir="/rd120/filtered_bam/"
+
+# Loop over all BAM files in the input directory
+for file in "${input_dir}"*.bam
+do
+    # Extract the file name without the path and extension
+    file_name=$(basename "${file%.bam}")
+    
+    # Run sambamba command and print file name being processed
+    echo "Processing file: ${file_name}"
+    sambamba view -h -t 6 -f bam -F "[XS] == null and not unmapped and not duplicate" "${file}" > "${output_dir}filtered_${file_name}.bam"
+done
+```
+
+```{bash eval=FALSE, include=TRUE}
+# Run the bash script
+bash sort_all.sh
+```
+
+## 8.5 Quantify the sorted & filtered sequences
+```{r eval=FALSE, include=TRUE}
+# We replace the output_name to filtered files
+filtered_bam <- list.files(path = '/rd120/filtered_bam', full.names = T)
+# Run quantification
+quant_filtered <- featureCounts(filtered_bam, 
+                       annot.ext='/rd120/GCF_000001405.38_GRCh38.p12_genomic.gtf',
+                       isGTFAnnotationFile = T)
+
+# save to local 
+write.csv(quant_filtered$counts, "/rd120/quant_filtered.csv") 
+```
+
+
+# 9. Download the metadata
+We need the metadata(e.g. sample groups, patient's gender, patient's age, etc.) for the linear models and the downstream analysis. 
+```{r eval=FALSE, include=TRUE}
+# GEO code
+gse_name <- 'GSE168496'
+# Get metadata from GEO code
+gse <- getGEO(gse_name)
+# Get series matrix
+gse <- gse$GSE168496_series_matrix.txt.gz
+
+# Extract metadata
+pd <-pData(gse)
+# Save to local
+saveRDS(pd, file = '/rd120/metadata')
+```
+
+# 10. Build count matrix
+In this step, we will build our count matrix. 
+You can repeat the downstream analysis by loading the metadata and the count matrix from the local disk.
+```{r}
+# Load metadata
+pd <- readRDS('/Users/senmnes/DESKTOP_HD/HUDSON/RNA_seq_DE/metadata')
+# Load quantification file
+quant_filtered <- read.csv('/Users/senmnes/DESKTOP_HD/HUDSON/RNA_seq_DE/quant_filtered.csv')
+```
+
+## 10.1 Data pre-processing
+Now we want to do some pre-processing for the matrix.
+```{r}
+# Rename the columns
+colnames(quant_filtered) <- c('Genes',pd$geo_accession)
+# Reconstruct the data frame from cols to rows
+quant_wide <- data.frame(t(quant_filtered))
+# Re-assign the column names
+colnames(quant_wide) <- quant_wide[1,]
+# Remove the unnecessary row
+quant_wide <- quant_wide[-1,]
+```
+
+Adding the co-variates to the matrix
+```{r}
+# Extract sex information
+disease <- factor(sub("disease state: ", "",pd$characteristics_ch1))
+# Rename vector elements using ifelse() function
+disease <- factor(ifelse(disease == 'Non-demented control', 'Control', 
+           ifelse(disease == "Parkinson's disease", "Parkinson_Disease", disease)))
+
+# Reformat the co-variates
+sex <- factor(sub("^gender: (.+)$", "\\1", pd$characteristics_ch1.2))
+age.at.death <- as.numeric(sub(".*:\\s*", "",pd$characteristics_ch1.3))
+p.m.delay <- sub(".*: (\\d{2}:\\d{2}:\\d{2})$", "\\1", pd$characteristics_ch1.4)
+p.m.delay <- as.duration(hms(p.m.delay))
+p.m.delay <- as.numeric(sub("~", "",(sub('.*\\((.*?) hours\\)', '\\1',p.m.delay))))
+```
+
+## 10.2 Construct the count matrix
+DGEList stands for "Differential Gene Expression List," and it is a list object that contains raw count data, information about the samples, and other relevant metadata. It can be created from count matrices and provides various methods for filtering, normalization, and differential gene expression analysis. 
+```{r}
+# Make a matrix
+DE_list <- DGEList(quant_filtered[,-1],
+                   group = sex,
+                   genes = quant_filtered[,1,drop=F])
+
+# Adding factors
+DE_list$samples$disease <- disease
+DE_list$samples$age.at.death <- age.at.death
+DE_list$samples$p.m.delay <- p.m.delay
+```
+
+Calculate the counts per million (CPM) and the Log2 Transformation
+```{r}
+# Calculate counts per million (CPM)
+cpm <- cpm(DE_list)
+# Log2 cpm
+lcpm <- cpm(DE_list, log =T)
+```
+
+A low average library size can indicate poor sequencing quality, low RNA quality or quantity, or technical issues during library preparation. A low library size can also affect the statistical power of downstream analyses, particularly in differential gene expression analysis, where it can lead to reduced sensitivity and accuracy.
+```{r}
+# Get average library size, 1E–6 is the same as 0.000001 (one millionth)
+L <- mean(DE_list$samples$lib.size) * 1e-6
+M <- median(DE_list$samples$lib.size) * 1e-6
+# Check the average library size
+c(L, M)
+```
+A good average library size for RNA-seq data is typically considered to be at least 20 million reads per sample. So in this case our samples have good quality.
+
+
+## Removing genes that are lowly expressed
+Lowly expressed genes are genes that have low abundance or expression levels, and they may contribute noise or bias to downstream analyses. By removing these genes, the remaining expressed genes are more likely to represent biologically relevant signal, which can improve the accuracy of differential expression analysis. 
+
+To ensure the quality of downstream analyses, it is recommended to exclude genes that have an inadequate number of reads across all samples. This is necessary for several reasons. From a biological perspective, genes that are not expressed at a biologically significant level in any condition are considered less important and should be disregarded for further analysis.
+```{r}
+# Check how many genes have zero counts across 16 samples, 16 is the total number of sample.
+table(rowSums(DE_list$counts==0)==16)
+
+# Filter out the low-count genes based on the SEX 
+keep.exprs <- filterByExpr(DE_list, group=sex)
+filtered_DE_list <- DE_list[keep.exprs,, keep.lib.sizes=FALSE]
+
+# Compare the filtered result
+dim(DE_list)
+dim(filtered_DE_list)
+```
+
+
+```{r}
+# Calculate the cutoff threshold, log-CPM threshold (equivalent to a CPM value of about 0.2)
+lcpm.cutoff <- log2(10/M + 2/L)
+nsamples <- ncol(DE_list)
+col <- brewer.pal(nsamples, "Paired")
+
+#### Plot ####
+par(mfrow=c(1,2))
+plot(density(lcpm[,1]), col=col[1], lwd=2, ylim=c(0,0.26), las=2, main="", xlab="")
+title(main="A. Raw data", xlab="Log-cpm")
+abline(v=lcpm.cutoff, lty=3)
+for (i in 2:nsamples){
+  den <- density(lcpm[,i])
+  lines(den$x, den$y, col=col[i], lwd=2)
+  }
+legend("topright", rownames(DE_list$samples), text.col=col, bty="n", cex = 0.7)
+#### End Plot ####
+
+#### Plot ####
+lcpm <- cpm(filtered_DE_list, log=TRUE)
+plot(density(lcpm[,1]), col=col[1], lwd=2, ylim=c(0,0.26), las=2, main="", xlab="")
+title(main="B. Filtered data", xlab="Log-cpm")
+abline(v=lcpm.cutoff, lty=3)
+for (i in 2:nsamples){
+  den <- density(lcpm[,i])
+  lines(den$x, den$y, col=col[i], lwd=2)
+}
+legend("topright", rownames(DE_list$samples), text.col=col, bty="n", cex=0.7)
+#### End Plot ####
+```
+From our above steps, we have filtered around 53% low read genes across all samples.
+
+# 11. Normalising gene expression distributions
+Normalizing the RNA-Seq count table is an important step in RNA-Seq data analysis because it aims to adjust for differences in sequencing depth and gene length between samples. Normalization helps to standardize the gene expression values, enabling more accurate comparisons between samples and making it easier to identify differentially expressed genes. Without normalization, differences in sequencing depth and gene length can lead to misleading results, particularly in differential gene expression analysis.
+```{r}
+# Normalization by the method of trimmed mean of M-values (TMM)
+norm_DE <- calcNormFactors(DE_list, method = "TMM")
+# Log Transformation
+lcpm <- cpm(norm_DE, log=TRUE)
+# Plot
+par(mfrow=c(1,2))
+par(cex.axis=0.7)
+un_cpm <- cpm(DE_list, log=TRUE) 
+boxplot(un_cpm, las=2, col=col, main="")
+title(main="Original data",ylab="Log-cpm")
+
+par(cex.axis=0.7)
+boxplot(lcpm, las=2, col=col, main="")
+title(main="Normalised data",ylab="Log-cpm")
+```
+
+# 12. Unsupervised clustering of samples
+The multi-dimensional scaling (MDS) plot is a useful tool for assessing the similarities and differences between samples in an unsupervised manner. It provides an initial insight into the extent to which differential expression can be identified before conducting formal tests. The ideal scenario is that samples cluster within their primary condition of interest, and any sample that deviates significantly from the group can be pinpointed and examined for sources of error or extra variation. If technical replicates are present, they should be closely clustered together.
+```{r warning=FALSE}
+# Adding the group
+col.sex <- sex
+levels(col.sex) <- brewer.pal(nlevels(col.sex), "Set1")
+col.sex <- as.character(col.sex)
+# Adding the group
+col.disease <- disease
+levels(col.disease) <- brewer.pal(nlevels(col.disease), "Set2")
+col.disease <- as.character(col.disease)
+
+# PCA plot
+# init .png file
+# png(file=paste0('/rd120/plots/',paste0('group_PCA.png')), width=720, height=480, unit= 'px')
+# 
+par(mfrow=c(1,2))
+plotMDS(lcpm, labels=sex, col=col.sex, cex = 0.7)
+title(main="A. SEX")
+#
+plotMDS(lcpm, labels=disease, col=col.disease, dim=c(3,4), cex = 0.5)
+title(main="B. Disease")
+
+# Close I/O
+# dev.off()
+```
+
+
+# 13. Differential expression analysis 
+## 13.1 Build design matrix & Fit with limma
+### Model 1 - Sex interact with PD; Female * none-PD(Control) as reference
+The first question we want to investigate is the gene expression profile under sex interacts with Parkinson's disease. With this model, we use males with PD compared with females with none-PD(control) as a reference and add the age and post-mortem delay as co-variates.
+```{r warning=FALSE}
+# Two factors interaction model - Sex * PD - Sex interact with PD
+SEX_PD_d.mtrix <- model.matrix(~sex*disease + age.at.death + p.m.delay)
+colnames(SEX_PD_d.mtrix) <- gsub("group", "", colnames(SEX_PD_d.mtrix))
+```
+
+- Voom (mean-variance modeling at the observational level) is a method used in RNA-Seq analysis for transforming count data to approximate normally distributed data. The Voom method is particularly useful in situations where sample sizes are small or where there is large variability in gene expression between samples. In Voom, the mean and variance of the count data are modeled as a function of the mean expression level of each gene. It has been shown to outperform other normalization and transformation methods in terms of improving the accuracy of differential gene expression analysis.
+```{r}
+# Estimate the mean-variance relationship
+SEX_PD_v <- voom(norm_DE, SEX_PD_d.mtrix, plot=TRUE)
+# Fit the linear model, input logCPM value
+SEX_PD_vfit <- lmFit(SEX_PD_v, SEX_PD_d.mtrix)
+```
+
+- Empirical Bayes moderation is used in the limma model to improve the accuracy of differential expression analysis by shrinking the sample variances towards a common value. In RNA-Seq experiments, gene expression measurements for a large number of genes are usually affected by low signal-to-noise ratios, which may result in unreliable estimates of the gene-specific variances.Empirical Bayes moderation helps to overcome this problem by borrowing information across genes to obtain more precise variance estimates. This approach allows for greater power to detect differentially expressed genes while controlling for the false discovery rate. 
+```{r}
+# Empirical Bayes moderation for all values
+SEX_PD_efit <- eBayes(SEX_PD_vfit, trend = T)
+# Plot data distribution
+print(plotSA(SEX_PD_efit, main="Final model: Mean-variance trend"))
+```
+
+```{r}
+# Output the filtered gene expression table, use 'number = nrow' 
+SEX_PD_Toptbl <- topTable(SEX_PD_efit, coef=ncol(SEX_PD_d.mtrix),
+                          number = nrow(SEX_PD_efit$p.value))
+
+head(SEX_PD_Toptbl)
+dim(SEX_PD_Toptbl)
+```
+
+### Model 2 - Sex differences - Female as reference
+The second question we want to investigate is the gene expression profile under sex differences. With this model, we use males compared with females as a reference and add the PD, age and post-mortem delay as co-variates.
+```{r warning=FALSE}
+# Sex Differences
+SEX_diff_d.mtrix <- model.matrix(~sex + disease + age.at.death + p.m.delay)
+colnames(SEX_diff_d.mtrix) <- gsub("group", "", colnames(SEX_diff_d.mtrix))
+  
+# Estimate the mean-variance relationship
+SEX_diff_v <- voom(norm_DE, SEX_diff_d.mtrix, plot=TRUE)
+# Fit the linear model
+SEX_diff_vfit <- lmFit(SEX_diff_v, SEX_diff_d.mtrix)
+# Empirical Bayes moderation for all values
+SEX_diff_efit <- eBayes(SEX_diff_vfit, trend = T)
+# Plot data distribution
+print(plotSA(SEX_diff_efit, main="Final model: Mean-variance trend"))
+```
+
+```{r}
+# Output filtered gene expression table
+SEX_diff_Toptbl <- topTable(SEX_diff_efit, coef=ncol(SEX_diff_d.mtrix),
+                            number = nrow(SEX_diff_efit$p.value))
+
+head(SEX_diff_Toptbl)
+dim(SEX_diff_Toptbl)
+```
+
+## P-value histogram
+Checking the histogram of p-values in RNA-Seq analysis is an important step to evaluate the overall quality of the statistical analysis. If the data contain batch effects or systematic differences between the samples, this can lead to an inflation of small p-values, resulting in a "long tail" distribution.
+
+```{r}
+# P value Histogram
+# init .png file - Save to local
+#png(file=paste0('/rd120/plots/',paste0('P.value_Histogram.png')), width=720, height=480, unit= 'px')
+# Make the plot
+par(mfrow=c(1,2))
+hist(SEX_PD_efit$p.value, main = 'Histogram of P.value of SEX * PD', xlab = 'P.value')
+hist(SEX_diff_efit$p.value, main = 'Histogram of P.value of SEX Diff.', xlab = 'P.value')
+# close I/O
+#dev.off()
+```
+In our cases, the P-value distribution looks correct and meet our expectation. The peak observed near the value of 0 represents the region where the alternative hypotheses are present, along with some possible false positives.
+
+## 13.2 Examining individual DE genes - Volcano, Heatmap
+### Heatmap for SEX_PD
+```{r warning=FALSE}
+  # Subset the logCPM data
+  o <- which(SEX_PD_v$genes$Genes %in% head(SEX_PD_Toptbl$Genes,20))
+  temp_dfo <- lcpm[o,]
+  # Rename the rows and columns
+  rownames(temp_dfo) <- head(SEX_PD_Toptbl$Genes,20)
+  colnames(temp_dfo) <- disease
+  colnames(temp_dfo) <- gsub('ND_control', 'Control', colnames(temp_dfo))
+  colnames(temp_dfo) <- gsub('Parkinson_Disease', 'PD', colnames(temp_dfo))
+  # Reorder the data frame by column name
+  temp_dfo<- as.data.frame(temp_dfo)
+  temp_dfo<-temp_dfo[,order(names(temp_dfo))]
+  colnames(temp_dfo) <- sub("\\..*", "", colnames(temp_dfo))
+  # Init the png file
+  #png(file=paste0('/rd120/plots/',paste0('SEX_PD_genes_Heatmap.png')), width=720, height=480, unit= 'px')
+  # Make the plot
+  superheat(temp_dfo,scale=T,heat.pal = c("blue", "white", "red"),
+            left.label.text.size = 3, 
+            bottom.label.text.size = 3,bottom.label.text.angle = 90, 
+            column.title = 'LogCPM', column.title.size = 4,
+            row.dendrogram = TRUE, 
+            left.label.col = "white",
+            bottom.label.col = c(rep("seagreen3",8),rep('indianred3',8)),
+            title = "Sex interacts with Parkinson\'s disease",
+            title.size = 5
+            )
+  # close I/O
+  #dev.off()
+```
+Although there are some minor differences, no significant expression differences were observed among the top 20 genes when comparing the SEX * PD group to the SEX * Control group. 
+
+- However, it is worth noting that some genes in the SEX * PD group exhibited higher CPM values.
+
+### Heatmap for SEX_diff
+```{r warning=FALSE}
+  # Subset the log-CPM data
+  i <- which(SEX_diff_v$genes$Genes %in% head(SEX_diff_Toptbl$Genes,20))
+  temp_df <- lcpm[i,]
+  # Rename the rows and cols
+  rownames(temp_df) <- head(SEX_diff_Toptbl$Genes,20)
+  colnames(temp_df) <- sex
+  # Sort the data frame by column name
+  temp_df<- as.data.frame(temp_df)
+  temp_df<-temp_df[,order(names(temp_df))]
+  colnames(temp_df) <- sub('\\..*', '', gsub('[0-9"]', '', colnames(temp_df)))
+  # init the png file - save to local
+  #png(file=paste0('/rd120/plots/',paste0('SEX_diff_genes_Heatmap.png')), width=720, height=480, unit= 'px')
+  # Make the plot 
+  superheat(temp_df,scale=T,heat.pal = c("blue", "white", "red"),
+            left.label.text.size = 3, 
+            bottom.label.text.size = 3,bottom.label.text.angle = 90, 
+            column.title = 'LogCPM', column.title.size = 4,
+            row.dendrogram = TRUE, 
+            left.label.col = "white",
+            bottom.label.col = c(rep("pink",6),rep('lightcyan',10)),
+            title = "Sex differences",
+            title.size = 5
+            )
+  # Close I/O
+  #dev.off()
+```
+Although there are some minor differences, no significant expression differences were observed among the top 20 genes when comparing the Female group to the Male group. 
+
+- However, it is worth noting that some genes in the male group exhibited lower CPM values.
+
+### Volcano plot
+The main purpose of a volcano plot is to identify the genes that are significantly differentially expressed (i.e., have a large fold change and low p-value) between the two groups. Additionally, the plot can help visualize the distribution of genes that are not differentially expressed or have low statistical significance.
+```{r}
+# Volcano plot function
+makeVolPlt <- function(df,title,logFC_threshold,font_size){
+  logFC_threshold<-as.numeric(logFC_threshold)
+  # Add a column of NAs
+  df$diffexpressed <- "NO"
+  # If log2Fold change > threshold and p.value < 0.05, set as "UP" 
+  df$diffexpressed[df$logFC > logFC_threshold 
+                              & df$P.Value < 0.05] <- "UP"
+  # If log2Fold change < threshold and p.value < 0.05, set as "DOWN"
+  df$diffexpressed[df$logFC < -logFC_threshold
+                              & df$P.Value < 0.05] <- "DOWN"
+  # Create a new column "delabel" to de, that will contain the name of genes differential expressed (NA in case they are not)
+  df$delabel <- NA
+  df$delabel[df$diffexpressed != "NO"] <- df$Genes[df$diffexpressed != "NO"]
+  
+  # Re-plot but this time color the points with "diffexpressed"
+  df_plot<-ggplot(data=df, aes(x=logFC, y=-log10(P.Value), col=diffexpressed, label=delabel)) +
+          geom_point(data = df[df$diffexpressed == "NO",], size = 2, shape = 19, alpha = 0.35) + 
+          geom_point(data = df[df$diffexpressed != "NO",], size = 2, shape = 19) + 
+          geom_text_repel(size = font_size*0.35,show.legend=FALSE) +
+          labs(color=' ', title = title) +
+          theme_classic() + 
+          scale_color_manual(values=c("blue3", "gray19", "indianred3")) + 
+          geom_vline(xintercept=c(-logFC_threshold, logFC_threshold), 
+                     linetype = "dashed", color = 'grey') +
+          geom_hline(yintercept=-log10(0.05), linetype = "dashed", color = 'grey') + 
+          theme(text = element_text(size=font_size),title = element_text(size = font_size * 1.5))
+  print(df_plot)
+  return(df)
+}
+```
+
+### Volcano plot - Sex * PD
+```{r warning=FALSE}
+sex_pd_exp <- makeVolPlt(SEX_PD_Toptbl, 'Sex interacts with Parkinson\'s disease', 1,8)
+```
+
+Save the plots(with adjusted font size) to local disk
+```{r eval=FALSE, warning=FALSE, include=TRUE}
+# init the png file
+png(file=paste0('/rd120/plots/',paste0('SEX_PD_genes_volcano.png')),
+    width=1210, height=1210, unit= 'px')
+# make the plot
+makeVolPlt(SEX_PD_Toptbl, 'Sex interacts with Parkinson\'s disease', 1,25)
+# close I/O
+dev.off()
+```
+
+
+### Volcano plot - Sex Difference
+```{r warning=FALSE}
+sex_dff_exp<- makeVolPlt(SEX_diff_Toptbl, 'Sex difference', 0.3, 8)
+```
+
+Save the plots(with adjusted font size) to local disk
+```{r eval=FALSE, warning=FALSE, include=TRUE}
+# init png file
+png(file=paste0('/rd120/plots/',paste0('SEX_diff_genes_volcano.png')),
+    width=1210, height=1210, unit= 'px')
+# make the plot
+makeVolPlt(SEX_diff_Toptbl, 'Sex difference', 0.3)
+# close I/O
+dev.off()
+```
+
+## 14. Box Plot for specific genes
+Boxplots can help identify differences in gene expression between groups of samples or conditions.
+We will make a boxplot for the top differentially expressed genes from the volcano plot.
+```{r}
+# init box plot function
+makeGenesBox <- function(df,x1,x2,y,title,subtitle){
+  x1 <- x1
+  print(ggplot(df, aes(x=x1, y=y)) + 
+    geom_boxplot(aes(fill=x1),width=0.7,outlier.size = -1) +
+    geom_jitter(aes(shape=x2),size = 6, width = 0.25) +
+    labs(y='LogCPM',x='',title = title,subtitle = subtitle)+
+    scale_shape_manual(values = if('TRUE' %in% grepl('Parkinson',x1)){c(21,23)}
+                       else{c(0,2)}) +
+    scale_fill_manual(values = if('TRUE' %in% grepl('Parkinson',x1)){c('seagreen3','indianred3')}
+                      else{c('pink','lightcyan')}) +
+    theme_light()+ 
+    theme(legend.position = 'right',
+            legend.background = element_rect(linetype="solid",colour ="black"),
+            plot.title = element_text(color = "blue"),
+            text = element_text(size=45),legend.title = element_blank(),
+            legend.key.size = unit(1, "cm"))+
+      guides(alpha="none"))
+}
+```
+
+### Boxplot - Sex * PD
+```{r}
+# Subset the log-CPM data
+i <- which(SEX_PD_v$genes$Genes %in% head(sex_pd_exp$Genes,20))
+sex_pd_boxplt <- as.data.frame(lcpm[i,])
+# Assign the gene names to data frame
+rownames(sex_pd_boxplt) <- head(sex_pd_exp$Genes,20)
+# Reconstruct the data frame
+sex_pd_boxplt<-as.data.frame(t(sex_pd_boxplt))
+# Add columns
+sex_pd_boxplt$Sex <- as.factor(sex)
+sex_pd_boxplt$Disease <- as.factor(disease)
+
+# Here we make a plot for display, gene = `BHLHE40`
+ print(ggplot(sex_pd_boxplt, aes(x=Disease, y=BHLHE40)) + 
+    geom_boxplot(aes(fill=Disease),width=0.7,outlier.size = -1) + # -1 means hide outlier
+    geom_jitter(aes(shape=Sex),size = 3, width = 0.25) +
+    labs(y='LogCPM',x='',title = 'BHLHE40', subtitle = 'Sex * PD')+
+    scale_shape_manual(values = c(21,23)) +
+    scale_fill_manual(values = c('seagreen3','indianred3')) + theme_light()+ 
+    theme(legend.position = 'right',
+            legend.background = element_rect(linetype="solid",colour ="black"),
+            plot.title = element_text(color = "blue"),
+            text = element_text(size=10),legend.title = element_blank(),
+            legend.key.size = unit(0.5, "cm"))+
+      guides(alpha="none"))
+```
+
+For the rest of the genes, we save the plots to the local disk.
+```{r eval=FALSE, include=TRUE}
+# Make boxplot
+# Print all figures
+for (j in 1:(length(colnames(sex_pd_boxplt))-2)){
+  # init the png file
+  png(file=paste0('/Users/senmnes/DESKTOP_HD/HUDSON/',paste0('SEX_PD_genes_boxplot/',colnames(sex_pd_boxplt)[j],'.png')), width=1210, height=1210, unit= 'px')
+  # Make plots
+  print(paste0('Printing for gene: ',colnames(sex_pd_boxplt)[j]))
+  makeGenesBox(sex_pd_boxplt, # data frame
+               sex_pd_boxplt$Disease, # x1
+               sex_pd_boxplt$Sex, # x2
+               sex_pd_boxplt[[j]], # y
+               colnames(sex_pd_boxplt)[j], # title
+               'Sex * PD' # subtitle
+               )
+  # close I/O
+  dev.off()
+}
+```
+
+### Boxplot - Sex diff
+```{r}
+# Subset the log-CPM data
+o <- which(SEX_diff_v$genes$Genes %in% head(sex_dff_exp$Genes,20))
+sex_diff_boxplt <- as.data.frame(lcpm[o,])
+# Assign gene names
+rownames(sex_diff_boxplt) <- head(sex_dff_exp$Genes,20)
+# Reconstruct the data frame
+sex_diff_boxplt<-as.data.frame(t(sex_diff_boxplt))
+# Add columns
+sex_diff_boxplt$Sex <- as.factor(sex)
+sex_diff_boxplt$Disease <- as.factor(disease)
+
+# Here we make a plot for display, gene = `LOC105369192`
+ print(ggplot(sex_diff_boxplt, aes(x=Sex, y=LOC105369192)) + 
+    geom_boxplot(aes(fill=Sex),width=0.7,outlier.size = -1) + # -1 means hide outlier
+    geom_jitter(aes(shape=Disease),size = 3, width = 0.25) +
+    labs(y='LogCPM',x='',title = 'LOC105369192', subtitle = 'Sex Differences')+
+    scale_shape_manual(values = c(0,2)) +
+    scale_fill_manual(values = c('pink','lightcyan')) + theme_light()+ 
+    theme(legend.position = 'right',
+            legend.background = element_rect(linetype="solid",colour ="black"),
+            plot.title = element_text(color = "blue"),
+            text = element_text(size=10),legend.title = element_blank(),
+            legend.key.size = unit(0.5, "cm"))+
+      guides(alpha="none"))
+```
+
+```{r eval=FALSE, include=TRUE}
+# Make Boxplot
+# print all figures
+for (j in 1:length(colnames(sex_diff_boxplt))){
+  # init the png file
+  png(file=paste0('/Users/senmnes/DESKTOP_HD/HUDSON/',paste0('SEX_diff_genes_boxplot/',colnames(sex_diff_boxplt)[j],'.png')), width=1210, height=1210, unit= 'px')
+  # Make plots
+  print(paste0('Printing for gene: ',colnames(sex_diff_boxplt)[j]))
+  makeGenesBox(sex_diff_boxplt,
+               sex_diff_boxplt$Sex,
+               sex_diff_boxplt$Disease,
+               sex_diff_boxplt[[j]],
+               colnames(sex_diff_boxplt)[j],
+               'Sex Differences'
+               )
+  # Close I/O
+  dev.off()
+}
+```
+
+
+# Reference
+Tranchevent LC et al., 2023, Transcriptomics analysis of post-mortem substantia nigra samples from Parkinson’s disease patients and controls. (data accessible at NCBI GEO database (Tranchevent et al., 2023), accession GSE168496).
+
+Law, C. W., Alhamdoosh, M., Su, S., Dong, X., Tian, L., Smyth, G. K., & Ritchie, M. E. (2018, December 28). RNA-seq analysis is easy as 1-2-3 with limma, Glimma and edgeR. F1000research.com. https://f1000research.com/articles/5-1408
+
+Chen, Y., Lun, A. T. L., & Smyth, G. K. (2016, August 2). From reads to genes to pathways: differential expression analysis of RNA-Seq experiments using Rsubread and the edgeR quasi-likelihood pipeline. F1000research.com. https://f1000research.com/articles/5-1438
+
+# Appendix A
+
+The plots and QC report generated from this pipeline have been uploaded to google drive
+ - https://drive.google.com/drive/folders/10QAZeOCYus0b-w2jjRqYuwfIFvIE1c5j?usp=share_link
+
+Please note that you need a Monash University account to access these data.
+
+```{r eval=FALSE, include=FALSE}
+# Con. Check differences of quantification results filtered v non-filtered
+# load quantification file
+quant_filtered <- read.csv('/rd120/quant_filtered.csv')
+quant_non_filtered <- read.csv('/rd120/quant.csv')
+
+summary(quant_filtered$filtered_sorted_SRR13895087.bam)
+summary(quant_non_filtered$SRR13895087.bam)
+```
