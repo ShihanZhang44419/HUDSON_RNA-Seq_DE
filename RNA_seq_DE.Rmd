@@ -1,5 +1,5 @@
 ---
-title: "RNA-Seq analysis pipline(Customized for GSE168496)"
+title: "RNA-Seq analysis pipeline(Customized for GSE168496)"
 author: "Shihan Zhang"
 date: "2023-02-21"
 output:
